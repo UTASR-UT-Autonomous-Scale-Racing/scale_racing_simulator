@@ -8,6 +8,7 @@ env = gym.make(
     inner_track_path = "./tracks/track_basic/inner.obj",
     outer_track_path = "./tracks/track_basic/outer.obj",
     render_mode = "bird-eye",
+    # render_mode = None,
     speed_modifier = 50
     )
 
@@ -113,7 +114,7 @@ def compute_throttle(heading_error, lateral_error, heading_weight = 0.4, lateral
 
     combined_factor = heading_weight * heading_factor + lateral_weight * lateral_factor
 
-    print("combined factor: ", combined_factor)
+    # print("combined factor: ", combined_factor)
 
     throttle = max_speed * (1 - combined_factor)
     return max(min_speed, throttle)  # Ensure minimum speed
