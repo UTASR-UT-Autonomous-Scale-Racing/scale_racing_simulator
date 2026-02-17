@@ -63,6 +63,7 @@ pub_sub_dict = AttrDict({
         {'topic': '/autodrive/roboracer_1/imu', 'type': Imu, 'name': 'pub_imu'},
         {'topic': '/autodrive/roboracer_1/lidar', 'type': LaserScan, 'name': 'pub_lidar'},
         {'topic': '/autodrive/roboracer_1/front_camera', 'type': Image, 'name': 'pub_front_camera'},
+        {'topic': '/autodrive/roboracer_1/depth_camera', 'type': Image, 'name': 'pub_depth_camera'},
         {'topic': '/autodrive/roboracer_1/lap_count', 'type': Int32, 'name': 'pub_lap_count'},
         {'topic': '/autodrive/roboracer_1/lap_time', 'type': Float32, 'name': 'pub_lap_time'},
         {'topic': '/autodrive/roboracer_1/last_lap_time', 'type': Float32, 'name': 'pub_last_lap_time'},

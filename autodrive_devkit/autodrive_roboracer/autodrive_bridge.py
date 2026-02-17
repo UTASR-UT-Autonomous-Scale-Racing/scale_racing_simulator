@@ -69,6 +69,7 @@ class AutoDRIVE:
         self.lidar_range_array        = np.zeros(1080, dtype=float)
         self.lidar_intensity_array    = np.asarray([])
         self.front_camera_image       = np.zeros((192, 108, 3), dtype=np.uint8)
+        self.depth_camera_image       = np.zeros((480, 540, 3), dtype=np.uint8)
         # Race data
         self.lap_count       = 0
         self.lap_time        = 0
@@ -179,6 +180,7 @@ def broadcast_transforms(tf_broadcaster, autodrive):
     tf_list.append(create_tf_msg("imu", "roboracer_1", np.asarray([0.08, 0.0, 0.055]), np.asarray([0.0, 0.0, 0.0, 1.0])))
     tf_list.append(create_tf_msg("lidar", "roboracer_1", np.asarray([0.2733, 0.0, 0.096]), np.asarray([0.0, 0.0, 0.0, 1.0])))
     tf_list.append(create_tf_msg("front_camera", "roboracer_1", np.asarray([-0.015, 0.0, 0.15]), np.asarray([0, 0.0871557, 0, 0.9961947])))
+    tf_list.append(create_tf_msg("depth_camera", "roboracer_1", np.asarray([-0.015, 0.0, 0.15]), np.asarray([0, 0.0871557, 0, 0.9961947])))
     tf_list.append(create_tf_msg("front_left_wheel", "roboracer_1", np.asarray([0.33, 0.118, 0.0]), quaternion_from_euler(0.0, 0.0, np.arctan((2*0.141537*np.tan(autodrive.steering))/(2*0.141537-2*0.0765*np.tan(autodrive.steering))))))
     tf_list.append(create_tf_msg("front_right_wheel", "roboracer_1", np.asarray([0.33, -0.118, 0.0]), quaternion_from_euler(0.0, 0.0, np.arctan((2*0.141537*np.tan(autodrive.steering))/(2*0.141537+2*0.0765*np.tan(autodrive.steering))))))
     tf_list.append(create_tf_msg("rear_left_wheel", "roboracer_1", np.asarray([0.0, 0.118, 0.0]), quaternion_from_euler(0.0, autodrive.encoder_angles[0]%6.283, 0.0)))
@@ -226,6 +228,10 @@ def publish_lidar_scan(lidar_scan_rate, lidar_range_array, lidar_intensity_array
 
 def publish_camera_images(front_camera_image):
     publishers['pub_front_camera'].publish(create_image_msg(front_camera_image, "front_camera"))
+
+# Depth Camera
+def publish_depth_images(depth_camera_image):
+    publishers['pub_depth_camera'].publish(create_image_msg(depth_camera_image, "depth_camera"))
 
 def publish_lap_count_data(lap_count):
     publishers['pub_lap_count'].publish(create_int_msg(msg_int32, lap_count))
@@ -280,66 +286,76 @@ def bridge(sid, data):
 
     # Wait for data to become available
     if data:
-        ########################################################################
-        # INCOMMING DATA
-        ########################################################################
-        # Actuator feedbacks
-        autodrive.throttle = float(data["V1 Throttle"])
-        autodrive.steering = float(data["V1 Steering"])
-        # Speed
-        autodrive.speed = float(data["V1 Speed"])
-        # Wheel encoders
-        autodrive.encoder_angles = np.fromstring(data["V1 Encoder Angles"], dtype=float, sep=' ')
-        # IPS
-        autodrive.position = np.fromstring(data["V1 Position"], dtype=float, sep=' ')
-        # IMU
-        autodrive.orientation_quaternion = np.fromstring(data["V1 Orientation Quaternion"], dtype=float, sep=' ')
-        autodrive.angular_velocity = np.fromstring(data["V1 Angular Velocity"], dtype=float, sep=' ')
-        autodrive.linear_acceleration = np.fromstring(data["V1 Linear Acceleration"], dtype=float, sep=' ')
-        # LIDAR
-        autodrive.lidar_scan_rate = float(data["V1 LIDAR Scan Rate"])
-        autodrive.lidar_range_array = np.fromstring(gzip.decompress(base64.b64decode(data["V1 LIDAR Range Array"])).decode('utf-8'), sep='\n')
-        # Cameras
-        autodrive.front_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Front Camera Image"]))))
-        # Lap data
-        autodrive.lap_count = int(float(data["V1 Lap Count"]))
-        autodrive.lap_time = float(data["V1 Lap Time"])
-        autodrive.last_lap_time = float(data["V1 Last Lap Time"])
-        autodrive.best_lap_time = float(data["V1 Best Lap Time"])
-        autodrive.collision_count = int(float(data["V1 Collisions"]))
+        try:
+            ########################################################################
+            # INCOMMING DATA
+            ########################################################################
+            # Actuator feedbacks
+            autodrive.throttle = float(data["V1 Throttle"])
+            autodrive.steering = float(data["V1 Steering"])
+            # Speed
+            autodrive.speed = float(data["V1 Speed"])
+            # Wheel encoders
+            autodrive.encoder_angles = np.fromstring(data["V1 Encoder Angles"], dtype=float, sep=' ')
+            # IPS
+            autodrive.position = np.fromstring(data["V1 Position"], dtype=float, sep=' ')
+            # IMU
+            autodrive.orientation_quaternion = np.fromstring(data["V1 Orientation Quaternion"], dtype=float, sep=' ')
+            autodrive.angular_velocity = np.fromstring(data["V1 Angular Velocity"], dtype=float, sep=' ')
+            autodrive.linear_acceleration = np.fromstring(data["V1 Linear Acceleration"], dtype=float, sep=' ')
+            # LIDAR
+            autodrive.lidar_scan_rate = float(data["V1 LIDAR Scan Rate"])
+            autodrive.lidar_range_array = np.fromstring(gzip.decompress(base64.b64decode(data["V1 LIDAR Range Array"])).decode('utf-8'), sep='\n')
+            # Cameras
+            autodrive.front_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Front Camera Image"]))))
+            if "V1 Depth Camera Image" in data:
+                autodrive.depth_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Depth Camera Image"]))))
+            # Lap data
+            autodrive.lap_count = int(float(data["V1 Lap Count"]))
+            autodrive.lap_time = float(data["V1 Lap Time"])
+            autodrive.last_lap_time = float(data["V1 Last Lap Time"])
+            autodrive.best_lap_time = float(data["V1 Best Lap Time"])
+            autodrive.collision_count = int(float(data["V1 Collisions"]))
 
-        # Actuator feedbacks
-        publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
-        # Speed
-        publish_speed_data(autodrive.speed)
-        # Wheel encoders
-        publish_encoder_data(autodrive.encoder_angles)
-        # IPS
-        publish_ips_data(autodrive.position)
-        # IMU
-        publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
-        # Coordinate transforms
-        broadcast_transforms(transform_broadcaster, autodrive)
-        # LIDAR
-        publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
-        # Cameras
-        publish_camera_images(autodrive.front_camera_image)
-        # Lap data
-        publish_lap_count_data(autodrive.lap_count)
-        publish_lap_time_data(autodrive.lap_time)
-        publish_last_lap_time_data(autodrive.last_lap_time)
-        publish_best_lap_time_data(autodrive.best_lap_time)
-        publish_collision_count_data(autodrive.collision_count)
+            # Actuator feedbacks
+            publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
+            # Speed
+            publish_speed_data(autodrive.speed)
+            # Wheel encoders
+            publish_encoder_data(autodrive.encoder_angles)
+            # IPS
+            publish_ips_data(autodrive.position)
+            # IMU
+            publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
+            # Coordinate transforms
+            broadcast_transforms(transform_broadcaster, autodrive)
+            # LIDAR
+            publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
+            # Cameras
+            publish_camera_images(autodrive.front_camera_image)
+            # Depth Camera
+            if "V1 Depth Camera Image" in data:
+                publish_depth_images(autodrive.depth_camera_image)
+            # Lap data
+            publish_lap_count_data(autodrive.lap_count)
+            publish_lap_time_data(autodrive.lap_time)
+            publish_last_lap_time_data(autodrive.last_lap_time)
+            publish_best_lap_time_data(autodrive.best_lap_time)
+            publish_collision_count_data(autodrive.collision_count)
 
-        ########################################################################
-        # OUTGOING DATA
-        ########################################################################
-        # Vehicle and simulation commands
-        sio.emit('Bridge', data={'V1 Throttle': str(autodrive.throttle_command),
-                                 'V1 Steering': str(autodrive.steering_command),
-                                 'Reset': str(autodrive.reset_command)
-                                 }
-                )
+            ########################################################################
+            # OUTGOING DATA
+            ########################################################################
+            # Vehicle and simulation commands
+            sio.emit('Bridge', data={'V1 Throttle': str(autodrive.throttle_command),
+                                    'V1 Steering': str(autodrive.steering_command),
+                                    'V1 Reset': str(autodrive.reset_command),
+                                    'Reset': str(autodrive.reset_command)
+                                    }
+                    )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
 #########################################################
 # AUTODRIVE ROS 2 BRIDGE INFRASTRUCTURE
