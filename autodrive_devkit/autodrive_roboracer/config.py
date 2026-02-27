@@ -29,7 +29,7 @@
 ################################################################################
 
 # ROS 2 module imports
-from std_msgs.msg import Int32, Float32, Bool # Int32, Float32 and Bool message classes
+from std_msgs.msg import Int32, Float32, Bool, String # Int32, Float32, Bool and String message classes
 from geometry_msgs.msg import Point # Point message class
 from sensor_msgs.msg import JointState, Imu, LaserScan, Image # JointState, Imu, LaserScan and Image message classes
 
@@ -68,6 +68,9 @@ pub_sub_dict = AttrDict({
         {'topic': '/autodrive/roboracer_1/lap_time', 'type': Float32, 'name': 'pub_lap_time'},
         {'topic': '/autodrive/roboracer_1/last_lap_time', 'type': Float32, 'name': 'pub_last_lap_time'},
         {'topic': '/autodrive/roboracer_1/best_lap_time', 'type': Float32, 'name': 'pub_best_lap_time'},
-        {'topic': '/autodrive/roboracer_1/collision_count', 'type': Int32, 'name': 'pub_collision_count'}
+        {'topic': '/autodrive/roboracer_1/collision_count', 'type': Int32, 'name': 'pub_collision_count'},
+        {'topic': '/autodrive/roboracer_1/stack/pose', 'type': String, 'name': 'pub_stack_pose'},
+        {'topic': '/autodrive/roboracer_1/stack/segmentation', 'type': String, 'name': 'pub_stack_segmentation'},
+        {'topic': '/autodrive/roboracer_1/stack/boundary', 'type': String, 'name': 'pub_stack_boundary'}
     ]
 })

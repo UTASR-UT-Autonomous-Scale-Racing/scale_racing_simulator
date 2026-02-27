@@ -32,11 +32,13 @@
 import rclpy # ROS 2 client library (rcl) for Python (built on rcl C API)
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy # Quality of Service (tune communication between nodes)
 import tf2_ros # ROS bindings for tf2 library to handle transforms
-from std_msgs.msg import Int32, Float32, Header # Int32, Float32 and Header message classes
+from std_msgs.msg import Int32, Float32, Header, String # Int32, Float32, Header, String message classes
 from geometry_msgs.msg import Point, TransformStamped # Point and TransformStamped message classes
 from sensor_msgs.msg import JointState, Imu, LaserScan, Image # JointState, Imu, LaserScan and Image message classes
 from tf_transformations import quaternion_from_euler # Euler angle representation to quaternion representation
 from threading import Thread # Thread-based parallelism
+import json # JSON serialization for network messages
+import zmq # ZeroMQ for inter-container communication
 
 # Python module imports
 from cv_bridge import CvBridge # ROS bridge for opencv library to handle images
@@ -85,8 +87,17 @@ class AutoDRIVE:
 ################################################################################
 
 # Global declarations
-global autodrive_bridge, cv_bridge, publishers, transform_broadcaster
+global autodrive_bridge, cv_bridge, publishers, transform_broadcaster, zmq_publisher
 autodrive = AutoDRIVE()
+zmq_publisher = None
+simulator_connected = False  # Track simulator connection state
+
+# ZMQ statistics
+zmq_stats = {
+    'published': 0,
+    'dropped': 0,
+    'last_report': 0
+}
 
 #########################################################
 # ROS 2 MESSAGE GENERATING FUNCTIONS
@@ -194,6 +205,7 @@ def broadcast_transforms(tf_broadcaster, autodrive):
 
 msg_int32 = Int32()
 msg_float32 = Float32()
+msg_string = String()
 msg_jointstate = JointState()
 msg_point = Point()
 msg_imu = Imu()
@@ -248,6 +260,70 @@ def publish_best_lap_time_data(best_lap_time):
 def publish_collision_count_data(collision_count):
     publishers['pub_collision_count'].publish(create_int_msg(msg_int32, collision_count))
 
+# SOFTWARE STACK OUTPUT PUBLISHERS (ZMQ -> ROS)
+def publish_stack_pose_data(payload_json: str):
+    msg_string.data = payload_json
+    publishers['pub_stack_pose'].publish(msg_string)
+
+def publish_stack_segmentation_data(payload_json: str):
+    msg_string.data = payload_json
+    publishers['pub_stack_segmentation'].publish(msg_string)
+
+def publish_stack_boundary_data(payload_json: str):
+    msg_string.data = payload_json
+    publishers['pub_stack_boundary'].publish(msg_string)
+
+#########################################################
+# ZEROMQ NETWORK PUBLISHER FUNCTIONS
+#########################################################
+
+def publish_to_network(autodrive):
+    """Publish sensor data to pilot_core via ZeroMQ."""
+    global zmq_publisher, zmq_stats, simulator_connected
+    if zmq_publisher is None or not simulator_connected:
+        return
+    
+    try:
+        # Build message payload
+        payload = {
+            'timestamp': autodrive_bridge.get_clock().now().to_msg().sec + 
+                        autodrive_bridge.get_clock().now().to_msg().nanosec * 1e-9,
+            'throttle': float(autodrive.throttle),
+            'steering': float(autodrive.steering),
+            'speed': float(autodrive.speed),
+            'position': autodrive.position.tolist(),
+            'orientation_quat': autodrive.orientation_quaternion.tolist(),
+            'angular_velocity': autodrive.angular_velocity.tolist(),
+            'linear_acceleration': autodrive.linear_acceleration.tolist(),
+            'front_camera': {
+                'shape': list(autodrive.front_camera_image.shape),
+                'data': base64.b64encode(autodrive.front_camera_image.tobytes()).decode('utf-8')
+            },
+            'depth_camera': {
+                'shape': list(autodrive.depth_camera_image.shape),
+                'data': base64.b64encode(autodrive.depth_camera_image.tobytes()).decode('utf-8')
+            } if autodrive.depth_camera_image is not None else None
+        }
+        
+        # Serialize and send (non-blocking)
+        msg_json = json.dumps(payload)
+        zmq_publisher.send_string(msg_json, zmq.NOBLOCK)
+        
+        # Update stats
+        zmq_stats['published'] += 1
+        
+    except zmq.Again:
+        # Buffer full, frame dropped
+        zmq_stats['dropped'] += 1
+        
+        # Report every 100 drops
+        if zmq_stats['dropped'] % 100 == 0:
+            drop_rate = zmq_stats['dropped'] / (zmq_stats['published'] + zmq_stats['dropped']) * 100
+            print(f"⚠ ZMQ: Dropped {zmq_stats['dropped']} frames ({drop_rate:.1f}% drop rate)")
+            
+    except Exception as e:
+        print(f"ZMQ publish error: {e}")
+
 #########################################################
 # ROS 2 SUBSCRIBER CALLBACKS
 #########################################################
@@ -276,7 +352,18 @@ sio = socketio.Server(async_mode='gevent')
 # Registering "connect" event handler for the server
 @sio.on('connect')
 def connect(sid, environ):
-    print("Connected!")
+    global simulator_connected
+    simulator_connected = True
+    print("Simulator connected!")
+
+# Registering "disconnect" event handler for the server
+@sio.on('disconnect')
+def disconnect(sid):
+    global simulator_connected, autodrive
+    simulator_connected = False
+    # Reset autodrive state to prevent stale data publishing
+    autodrive = AutoDRIVE()
+    print("Simulator disconnected!")
 
 # Registering "Bridge" event handler for the server
 @sio.on('Bridge')
@@ -342,6 +429,11 @@ def bridge(sid, data):
             publish_last_lap_time_data(autodrive.last_lap_time)
             publish_best_lap_time_data(autodrive.best_lap_time)
             publish_collision_count_data(autodrive.collision_count)
+            
+            ########################################################################
+            # NETWORK PUBLISHING (ZeroMQ to pilot_core)
+            ########################################################################
+            publish_to_network(autodrive)
 
             ########################################################################
             # OUTGOING DATA
@@ -356,6 +448,117 @@ def bridge(sid, data):
         except Exception as e:
             import traceback
             traceback.print_exc()
+
+#########################################################
+# ZEROMQ COMMAND RECEIVER THREAD
+#########################################################
+
+# Shutdown event for graceful termination
+import threading
+zmq_shutdown_event = threading.Event()
+
+def zmq_command_receiver_thread(zmq_subscriber):
+    """Background thread to receive ZMQ payloads from software stack."""
+    global autodrive
+    print("ZMQ receiver thread started (stack outputs)")
+    
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+    
+    while not zmq_shutdown_event.is_set():
+        try:
+            # Non-blocking receive with timeout (100ms)
+            msg_text = zmq_subscriber.recv_string(zmq.NOBLOCK)
+            # print(f"ZMQ RAW: {msg_text}")
+
+            # Support topic-prefixed payloads: "topic {json}"
+            topic = None
+            payload_text = msg_text
+            if " " in msg_text:
+                candidate_topic, candidate_payload = msg_text.split(" ", 1)
+                if candidate_topic in {"control", "telemetry", "pose", "segmentation", "map", "boundary"}:
+                    topic = candidate_topic
+                    payload_text = candidate_payload
+
+            # Robust JSON parsing (ignore trailing data)
+            decoder = json.JSONDecoder()
+            try:
+                payload, end = decoder.raw_decode(payload_text)
+                if payload_text[end:].strip():
+                    # Ignore trailing garbage after the first JSON object
+                    payload_text = payload_text[:end]
+            except json.JSONDecodeError:
+                # Fallback: if message has a topic but failed parse, try parsing after first space
+                if topic is None and " " in msg_text:
+                    _, fallback_payload = msg_text.split(" ", 1)
+                    payload, end = decoder.raw_decode(fallback_payload)
+                    payload_text = fallback_payload[:end] if fallback_payload[end:].strip() else fallback_payload
+                else:
+                    raise
+
+            if topic == "segmentation":
+                publish_stack_segmentation_data(payload_text)
+
+            elif topic == "telemetry" or topic == "pose":
+                publish_stack_pose_data(payload_text)
+
+            elif topic == "map" or topic == "boundary":
+                publish_stack_boundary_data(payload_text)
+
+            elif topic is None or topic == "control":
+                # Treat as control command to simulator
+                if 'throttle' in payload:
+                    autodrive.throttle_command = float(payload['throttle'])
+                if 'steering' in payload:
+                    autodrive.steering_command = float(payload['steering'])
+                if 'reset' in payload:
+                    autodrive.reset_command = bool(payload['reset'])
+
+                sio.emit('Bridge', data={
+                    'V1 Throttle': str(autodrive.throttle_command),
+                    'V1 Steering': str(autodrive.steering_command),
+                    'V1 Reset': str(autodrive.reset_command),
+                    'Reset': str(autodrive.reset_command)
+                })
+
+            else:
+                print(f"ZMQ: Unhandled topic '{topic}'")
+
+            # Reset error counter on success
+            consecutive_errors = 0
+                
+        except zmq.Again:
+            # No message available, sleep briefly and continue
+            zmq_shutdown_event.wait(0.01)  # 10ms sleep, but can be interrupted
+            continue
+            
+        except json.JSONDecodeError as e:
+            print(f"ZMQ: Invalid JSON received: {e}")
+            consecutive_errors += 1
+            
+        except (ValueError, KeyError) as e:
+            print(f"ZMQ: Invalid command data: {e}")
+            consecutive_errors += 1
+            
+        except zmq.ZMQError as e:
+            print(f"ZMQ: Socket error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("ZMQ: Too many consecutive errors, terminating receiver thread")
+                break
+            zmq_shutdown_event.wait(0.1)  # Back off on errors
+            
+        except Exception as e:
+            print(f"ZMQ: Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("ZMQ: Too many consecutive errors, terminating receiver thread")
+                break
+            zmq_shutdown_event.wait(0.1)
+    
+    print("ZMQ command receiver thread terminated")
 
 #########################################################
 # AUTODRIVE ROS 2 BRIDGE INFRASTRUCTURE
@@ -398,7 +601,30 @@ def bridge(sid, data):
 
 def main():
     # Global declarations
-    global autodrive, autodrive_bridge, cv_bridge, publishers, transform_broadcaster
+    global autodrive, autodrive_bridge, cv_bridge, publishers, transform_broadcaster, zmq_publisher
+
+    # ZeroMQ infrastructure
+    zmq_context = zmq.Context()
+    
+    # Publisher socket for sensor data (pilot_core subscribes to this)
+    zmq_publisher = zmq_context.socket(zmq.PUB)
+    zmq_publisher.setsockopt(zmq.SNDHWM, 10)  # Only buffer last 10 frames (images are large!)
+    zmq_publisher.setsockopt(zmq.LINGER, 0)   # Don't wait on close
+    zmq_publisher.bind("tcp://*:5555")
+    print("ZMQ Publisher bound to port 5555 (sensor data, HWM=10)")
+    
+    # Subscriber socket for control commands (pilot_core publishes to this)
+    zmq_subscriber = zmq_context.socket(zmq.SUB)
+    zmq_subscriber.setsockopt(zmq.RCVHWM, 10)  # Only buffer last 10 commands
+    zmq_subscriber.setsockopt(zmq.LINGER, 0)   # Don't wait on close
+    zmq_subscriber.setsockopt(zmq.CONFLATE, 1)  # Keep only latest message
+    zmq_subscriber.connect("tcp://localhost:5556")  # Connect to pilot_core container
+    zmq_subscriber.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
+    print("ZMQ Subscriber connected to stack:5556 (outputs/commands, HWM=10)")
+    
+    # Start ZMQ command receiver thread
+    # zmq_thread = Thread(target=zmq_command_receiver_thread, args=(zmq_subscriber,), daemon=True)
+    # zmq_thread.start()
 
     # ROS 2 infrastructure
     rclpy.init() # Initialize ROS 2 communication for this context
@@ -432,14 +658,33 @@ def main():
     process.start() # Activate the thread as a demon (background process) and prompt it to the target function (spin the executor)
 
     app = socketio.WSGIApp(sio) # Create socketio WSGI application
-    pywsgi.WSGIServer(('', 4567), app, handler_class=WebSocketHandler).serve_forever() # Deploy as a gevent WSGI server
     
-    # Cleanup
-    executor.shutdown() # Executor shutdown
-    autodrive_bridge.destroy_node() # Explicitly destroy the node
-    rclpy.shutdown() # Shutdown this context
+    try:
+        pywsgi.WSGIServer(('', 4567), app, handler_class=WebSocketHandler).serve_forever() # Deploy as a gevent WSGI server
+    except KeyboardInterrupt:
+        print("\nShutting down autodrive_bridge...")
+    finally:
+        # Signal ZMQ thread to stop
+        zmq_shutdown_event.set()
+        zmq_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
+        
+        # Cleanup ZMQ
+        if zmq_publisher:
+            zmq_publisher.close()
+        if zmq_subscriber:
+            zmq_subscriber.close()
+        if zmq_context:
+            zmq_context.term()
+        
+        # Cleanup ROS2
+        executor.shutdown() # Executor shutdown
+        autodrive_bridge.destroy_node() # Explicitly destroy the node
+        rclpy.shutdown() # Shutdown this context
+        
+        print("Autodrive bridge terminated cleanly")
 
 ################################################################################
 
 if __name__ == '__main__':
     main() # Call main function of AutoDRIVE ROS 2 bridge
+

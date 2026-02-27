@@ -38,6 +38,7 @@ RUN pip3 install Jinja2==3.0.3
 RUN pip3 install itsdangerous==2.0.1
 RUN pip3 install werkzeug==2.0.3
 RUN pip3 install transforms3d
+RUN pip3 install zmq
 
 # Install ROS 2 dependencies
 RUN apt update && apt install -y --no-install-recommends \
