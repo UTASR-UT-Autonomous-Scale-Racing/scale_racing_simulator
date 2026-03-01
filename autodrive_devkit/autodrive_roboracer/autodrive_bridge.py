@@ -275,7 +275,12 @@ def publish_stack_segmentation_data(payload_json: str):
         raw = base64.b64decode(p['mask'])
         shape = tuple(p['shape'])
         mask = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+        # Normalize sparse-value masks (e.g. depth cast to uint8 gives [0,10])
+        # so they fill the [0, 255] range and are visible in RViz/rqt_image_view.
         if mask.ndim == 2:
+            mx = int(mask.max())
+            if 0 < mx < 64:
+                mask = (mask.astype(np.float32) * (255.0 / mx)).astype(np.uint8)
             img_msg = cv_bridge.cv2_to_imgmsg(mask, encoding='mono8')
         else:
             img_msg = cv_bridge.cv2_to_imgmsg(mask, encoding='rgb8')
