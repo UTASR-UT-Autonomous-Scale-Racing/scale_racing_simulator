@@ -32,17 +32,21 @@
 import rclpy # ROS 2 client library (rcl) for Python (built on rcl C API)
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy # Quality of Service (tune communication between nodes)
 import tf2_ros # ROS bindings for tf2 library to handle transforms
-from std_msgs.msg import Int32, Float32, Header, String # Int32, Float32, Header, String message classes
+from std_msgs.msg import Int32, Float32, Header, String, ColorRGBA # Int32, Float32, Header, String message classes
 from geometry_msgs.msg import Point, TransformStamped # Point and TransformStamped message classes
 from sensor_msgs.msg import JointState, Imu, LaserScan, Image # JointState, Imu, LaserScan and Image message classes
+from visualization_msgs.msg import Marker, MarkerArray # Marker types for RViz visualization
 from tf_transformations import quaternion_from_euler # Euler angle representation to quaternion representation
 from threading import Thread # Thread-based parallelism
 import json # JSON serialization for network messages
 import zmq # ZeroMQ for inter-container communication
+import cv2 # OpenCV for fast image encoding
 
 # Python module imports
 from cv_bridge import CvBridge # ROS bridge for opencv library to handle images
+import gevent # Coroutine-based concurrency library
 from gevent import pywsgi # Pure-Python gevent-friendly WSGI server
+from gevent.threadpool import ThreadPool # Real OS thread pool (doesn't block gevent event loop)
 from geventwebsocket.handler import WebSocketHandler # Handler for WebSocket messages and lifecycle events
 import socketio # Socket.IO realtime client and server
 import numpy as np # Scientific computing
@@ -266,12 +270,50 @@ def publish_stack_pose_data(payload_json: str):
     publishers['pub_stack_pose'].publish(msg_string)
 
 def publish_stack_segmentation_data(payload_json: str):
-    msg_string.data = payload_json
-    publishers['pub_stack_segmentation'].publish(msg_string)
+    try:
+        p = json.loads(payload_json)
+        raw = base64.b64decode(p['mask'])
+        shape = tuple(p['shape'])
+        mask = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+        if mask.ndim == 2:
+            img_msg = cv_bridge.cv2_to_imgmsg(mask, encoding='mono8')
+        else:
+            img_msg = cv_bridge.cv2_to_imgmsg(mask, encoding='rgb8')
+        img_msg.header.stamp = autodrive_bridge.get_clock().now().to_msg()
+        img_msg.header.frame_id = 'front_camera'
+        publishers['pub_stack_segmentation'].publish(img_msg)
+    except Exception:
+        import traceback; traceback.print_exc()
 
 def publish_stack_boundary_data(payload_json: str):
-    msg_string.data = payload_json
-    publishers['pub_stack_boundary'].publish(msg_string)
+    try:
+        p = json.loads(payload_json)
+        now = autodrive_bridge.get_clock().now().to_msg()
+        marker_array = MarkerArray()
+        lines = [
+            ('outer_line', 0, (1.0, 0.0, 0.0)),  # red
+            ('inner_line', 1, (0.0, 0.0, 1.0)),  # blue
+        ]
+        for key, mid, (r, g, b) in lines:
+            if key not in p or not p[key]:
+                continue
+            m = Marker()
+            m.header.stamp = now
+            m.header.frame_id = 'world'
+            m.ns = 'boundary'
+            m.id = mid
+            m.type = Marker.LINE_STRIP
+            m.action = Marker.ADD
+            m.scale.x = 0.03  # line width in metres
+            m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0
+            for pt in p[key]:
+                gp = Point()
+                gp.x = float(pt[0]); gp.y = float(pt[1]); gp.z = 0.0
+                m.points.append(gp)
+            marker_array.markers.append(m)
+        publishers['pub_stack_boundary'].publish(marker_array)
+    except Exception:
+        import traceback; traceback.print_exc()
 
 #########################################################
 # ZEROMQ NETWORK PUBLISHER FUNCTIONS
@@ -284,9 +326,27 @@ def publish_to_network(autodrive):
         return
     
     try:
+        # Forward raw JPEG bytes directly — no decode/re-encode round-trip
+        # If async capture hasn't completed yet, send None — IMU/pose still go through
+        front_jpeg = getattr(autodrive, '_front_jpeg', None)
+        front_cam_payload = {
+            'data': base64.b64encode(front_jpeg).decode('utf-8'),
+            'encoding': 'jpeg',
+        } if front_jpeg is not None else None
+
+        # Depth: forward raw bytes from simulator (JPEG), skip PNG re-encode (~30ms saved)
+        depth_jpeg = getattr(autodrive, '_depth_jpeg', None)
+        if depth_jpeg is not None:
+            depth_cam_payload = {
+                'data': base64.b64encode(depth_jpeg).decode('utf-8'),
+                'encoding': 'jpeg',
+            }
+        else:
+            depth_cam_payload = None
+
         # Build message payload
         payload = {
-            'timestamp': autodrive_bridge.get_clock().now().to_msg().sec + 
+            'timestamp': autodrive_bridge.get_clock().now().to_msg().sec +
                         autodrive_bridge.get_clock().now().to_msg().nanosec * 1e-9,
             'throttle': float(autodrive.throttle),
             'steering': float(autodrive.steering),
@@ -295,14 +355,8 @@ def publish_to_network(autodrive):
             'orientation_quat': autodrive.orientation_quaternion.tolist(),
             'angular_velocity': autodrive.angular_velocity.tolist(),
             'linear_acceleration': autodrive.linear_acceleration.tolist(),
-            'front_camera': {
-                'shape': list(autodrive.front_camera_image.shape),
-                'data': base64.b64encode(autodrive.front_camera_image.tobytes()).decode('utf-8')
-            },
-            'depth_camera': {
-                'shape': list(autodrive.depth_camera_image.shape),
-                'data': base64.b64encode(autodrive.depth_camera_image.tobytes()).decode('utf-8')
-            } if autodrive.depth_camera_image is not None else None
+            'front_camera': front_cam_payload,
+            'depth_camera': depth_cam_payload,
         }
         
         # Serialize and send (non-blocking)
@@ -365,89 +419,97 @@ def disconnect(sid):
     autodrive = AutoDRIVE()
     print("Simulator disconnected!")
 
+def _process_frame(data):
+    """Process one simulator frame in a thread pool worker.
+
+    Runs gzip, all ROS2 publishes, and ZMQ publish in a real OS thread so the
+    gevent event loop is never blocked by DDS or C-level calls.
+
+    Camera images are kept as raw JPEG bytes (no PIL decode) and forwarded
+    directly to ZMQ to avoid a decode→re-encode round-trip.  ROS2 camera image
+    topics are skipped since pilot_core uses ZMQ, not ROS2, for sensor data.
+    """
+    global autodrive, autodrive_bridge, cv_bridge, publishers, transform_broadcaster
+    try:
+        # Actuator feedbacks
+        autodrive.throttle = float(data["V1 Throttle"])
+        autodrive.steering = float(data["V1 Steering"])
+        # Speed
+        autodrive.speed = float(data["V1 Speed"])
+        # Wheel encoders
+        autodrive.encoder_angles = np.fromstring(data["V1 Encoder Angles"], dtype=float, sep=' ')
+        # IPS
+        autodrive.position = np.fromstring(data["V1 Position"], dtype=float, sep=' ')
+        # IMU
+        autodrive.orientation_quaternion = np.fromstring(data["V1 Orientation Quaternion"], dtype=float, sep=' ')
+        autodrive.angular_velocity = np.fromstring(data["V1 Angular Velocity"], dtype=float, sep=' ')
+        autodrive.linear_acceleration = np.fromstring(data["V1 Linear Acceleration"], dtype=float, sep=' ')
+        # LIDAR
+        autodrive.lidar_scan_rate = float(data["V1 LIDAR Scan Rate"])
+        autodrive.lidar_range_array = np.fromstring(gzip.decompress(base64.b64decode(data["V1 LIDAR Range Array"])).decode('utf-8'), sep='\n')
+        # Cameras — store raw JPEG bytes, no PIL decode needed for ZMQ path
+        if "V1 Front Camera Image" in data:
+            autodrive._front_jpeg = base64.b64decode(data["V1 Front Camera Image"])
+        autodrive._depth_jpeg = base64.b64decode(data["V1 Depth Camera Image"]) if "V1 Depth Camera Image" in data else None
+        # Lap data
+        autodrive.lap_count = int(float(data["V1 Lap Count"]))
+        autodrive.lap_time = float(data["V1 Lap Time"])
+        autodrive.last_lap_time = float(data["V1 Last Lap Time"])
+        autodrive.best_lap_time = float(data["V1 Best Lap Time"])
+        autodrive.collision_count = int(float(data["V1 Collisions"]))
+
+        # ROS2 publishing (scalar topics only — image topics skipped, ~100ms saved)
+        # publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
+        # publish_speed_data(autodrive.speed)
+        # publish_encoder_data(autodrive.encoder_angles)
+        # publish_ips_data(autodrive.position)
+        # publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
+        # broadcast_transforms(transform_broadcaster, autodrive)
+        # publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
+        # publish_lap_count_data(autodrive.lap_count)
+        # publish_lap_time_data(autodrive.lap_time)
+        # publish_last_lap_time_data(autodrive.last_lap_time)
+        # publish_best_lap_time_data(autodrive.best_lap_time)
+        # publish_collision_count_data(autodrive.collision_count)
+
+        # ZMQ publish to pilot_core
+        publish_to_network(autodrive)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+# One worker thread: frames processed serially so the ZMQ socket is never
+# accessed from two threads simultaneously.
+_frame_pool = ThreadPool(1)
+
+
+# Bridge FPS counter
+_bridge_frame_count = 0
+_bridge_last_report = 0.0
+
 # Registering "Bridge" event handler for the server
 @sio.on('Bridge')
 def bridge(sid, data):
-    # Global declarations
-    global autodrive, autodrive_bridge, cv_bridge, publishers, transform_broadcaster
-
-    # Wait for data to become available
+    global autodrive, _bridge_frame_count, _bridge_last_report
     if data:
-        try:
-            ########################################################################
-            # INCOMMING DATA
-            ########################################################################
-            # Actuator feedbacks
-            autodrive.throttle = float(data["V1 Throttle"])
-            autodrive.steering = float(data["V1 Steering"])
-            # Speed
-            autodrive.speed = float(data["V1 Speed"])
-            # Wheel encoders
-            autodrive.encoder_angles = np.fromstring(data["V1 Encoder Angles"], dtype=float, sep=' ')
-            # IPS
-            autodrive.position = np.fromstring(data["V1 Position"], dtype=float, sep=' ')
-            # IMU
-            autodrive.orientation_quaternion = np.fromstring(data["V1 Orientation Quaternion"], dtype=float, sep=' ')
-            autodrive.angular_velocity = np.fromstring(data["V1 Angular Velocity"], dtype=float, sep=' ')
-            autodrive.linear_acceleration = np.fromstring(data["V1 Linear Acceleration"], dtype=float, sep=' ')
-            # LIDAR
-            autodrive.lidar_scan_rate = float(data["V1 LIDAR Scan Rate"])
-            autodrive.lidar_range_array = np.fromstring(gzip.decompress(base64.b64decode(data["V1 LIDAR Range Array"])).decode('utf-8'), sep='\n')
-            # Cameras
-            autodrive.front_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Front Camera Image"]))))
-            if "V1 Depth Camera Image" in data:
-                autodrive.depth_camera_image = np.asarray(Image.open(BytesIO(base64.b64decode(data["V1 Depth Camera Image"]))))
-            # Lap data
-            autodrive.lap_count = int(float(data["V1 Lap Count"]))
-            autodrive.lap_time = float(data["V1 Lap Time"])
-            autodrive.last_lap_time = float(data["V1 Last Lap Time"])
-            autodrive.best_lap_time = float(data["V1 Best Lap Time"])
-            autodrive.collision_count = int(float(data["V1 Collisions"]))
-
-            # Actuator feedbacks
-            publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
-            # Speed
-            publish_speed_data(autodrive.speed)
-            # Wheel encoders
-            publish_encoder_data(autodrive.encoder_angles)
-            # IPS
-            publish_ips_data(autodrive.position)
-            # IMU
-            publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
-            # Coordinate transforms
-            broadcast_transforms(transform_broadcaster, autodrive)
-            # LIDAR
-            publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
-            # Cameras
-            publish_camera_images(autodrive.front_camera_image)
-            # Depth Camera
-            if "V1 Depth Camera Image" in data:
-                publish_depth_images(autodrive.depth_camera_image)
-            # Lap data
-            publish_lap_count_data(autodrive.lap_count)
-            publish_lap_time_data(autodrive.lap_time)
-            publish_last_lap_time_data(autodrive.last_lap_time)
-            publish_best_lap_time_data(autodrive.best_lap_time)
-            publish_collision_count_data(autodrive.collision_count)
-            
-            ########################################################################
-            # NETWORK PUBLISHING (ZeroMQ to pilot_core)
-            ########################################################################
-            publish_to_network(autodrive)
-
-            ########################################################################
-            # OUTGOING DATA
-            ########################################################################
-            # Vehicle and simulation commands
-            sio.emit('Bridge', data={'V1 Throttle': str(autodrive.throttle_command),
-                                    'V1 Steering': str(autodrive.steering_command),
-                                    'V1 Reset': str(autodrive.reset_command),
-                                    'Reset': str(autodrive.reset_command)
-                                    }
-                    )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+        import time as _time
+        # Respond to simulator IMMEDIATELY — never blocked by processing
+        sio.emit('Bridge', data={
+            'V1 Throttle': str(autodrive.throttle_command),
+            'V1 Steering': str(autodrive.steering_command),
+            'V1 Reset': str(autodrive.reset_command),
+            'Reset': str(autodrive.reset_command)
+        })
+        # FPS counter — prints once per second
+        _bridge_frame_count += 1
+        _now = _time.time()
+        if _now - _bridge_last_report >= 1.0:
+            print(f"[Bridge] Simulator FPS: {_bridge_frame_count / (_now - _bridge_last_report):.1f}" if _bridge_last_report else "")
+            _bridge_frame_count = 0
+            _bridge_last_report = _now
+        # All heavy work runs in a real OS thread, not in the gevent event loop
+        _frame_pool.spawn(_process_frame, data)
 
 #########################################################
 # ZEROMQ COMMAND RECEIVER THREAD
@@ -506,20 +568,13 @@ def zmq_command_receiver_thread(zmq_subscriber):
                 publish_stack_boundary_data(payload_text)
 
             elif topic is None or topic == "control":
-                # Treat as control command to simulator
+                # Update command state — bridge() emits these on the next simulator frame
                 if 'throttle' in payload:
                     autodrive.throttle_command = float(payload['throttle'])
                 if 'steering' in payload:
                     autodrive.steering_command = float(payload['steering'])
                 if 'reset' in payload:
                     autodrive.reset_command = bool(payload['reset'])
-
-                sio.emit('Bridge', data={
-                    'V1 Throttle': str(autodrive.throttle_command),
-                    'V1 Steering': str(autodrive.steering_command),
-                    'V1 Reset': str(autodrive.reset_command),
-                    'Reset': str(autodrive.reset_command)
-                })
 
             else:
                 print(f"ZMQ: Unhandled topic '{topic}'")
@@ -615,16 +670,17 @@ def main():
     
     # Subscriber socket for control commands (pilot_core publishes to this)
     zmq_subscriber = zmq_context.socket(zmq.SUB)
-    zmq_subscriber.setsockopt(zmq.RCVHWM, 10)  # Only buffer last 10 commands
+    zmq_subscriber.setsockopt(zmq.RCVHWM, 50)  # Buffer commands + telemetry from both ports
     zmq_subscriber.setsockopt(zmq.LINGER, 0)   # Don't wait on close
-    zmq_subscriber.setsockopt(zmq.CONFLATE, 1)  # Keep only latest message
-    zmq_subscriber.connect("tcp://localhost:5556")  # Connect to pilot_core container
+    # No CONFLATE — allows segmentation/boundary messages to queue alongside control commands
+    zmq_subscriber.connect("tcp://localhost:5556")  # Control commands (ActuatorWorker)
+    zmq_subscriber.connect("tcp://localhost:5557")  # Telemetry (ZMQPublishWorker: segmentation, boundaries)
     zmq_subscriber.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
-    print("ZMQ Subscriber connected to stack:5556 (outputs/commands, HWM=10)")
+    print("ZMQ Subscriber connected to stack:5556 (control) and stack:5557 (telemetry)")
     
     # Start ZMQ command receiver thread
-    # zmq_thread = Thread(target=zmq_command_receiver_thread, args=(zmq_subscriber,), daemon=True)
-    # zmq_thread.start()
+    zmq_thread = Thread(target=zmq_command_receiver_thread, args=(zmq_subscriber,), daemon=True)
+    zmq_thread.start()
 
     # ROS 2 infrastructure
     rclpy.init() # Initialize ROS 2 communication for this context
