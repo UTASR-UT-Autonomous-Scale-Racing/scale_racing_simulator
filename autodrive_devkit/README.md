@@ -55,8 +55,8 @@ This directory hosts ROS 2 API (a meta-package), which supports modular algorith
     - ROS 2 dependencies for data processing and visualization (usually any version will do the job):
 
       ```bash
-      $ sudo apt install ros-$ROS_DISTRO-tf-transformations
-      $ sudo apt install ros-$ROS_DISTRO-imu-tools
+      sudo apt install ros-$ROS_DISTRO-tf-transformations
+      sudo apt install ros-$ROS_DISTRO-imu-tools
       ```
 
 ## USAGE
@@ -64,12 +64,12 @@ This directory hosts ROS 2 API (a meta-package), which supports modular algorith
 - **Bringup:**
     - **Headless Mode Bringup:**
       ```bash
-      $ ros2 launch autodrive_roboracer bringup_headless.launch.py
+      ros2 launch autodrive_roboracer bringup_headless.launch.py
       ```
       **[OR]**
     - **Graphics Mode Bringup:**
       ```bash
-      $ ros2 launch autodrive_roboracer bringup_graphics.launch.py
+      ros2 launch autodrive_roboracer bringup_graphics.launch.py
       ```
 
 - **Teleoperation:**
