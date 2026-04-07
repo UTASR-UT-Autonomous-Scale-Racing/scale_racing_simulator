@@ -77,11 +77,13 @@ class AutoDRIVE:
         self.front_camera_image       = np.zeros((192, 108, 3), dtype=np.uint8)
         self.depth_camera_image       = np.zeros((480, 540, 3), dtype=np.uint8)
         # Race data
-        self.lap_count       = 0
-        self.lap_time        = 0
-        self.last_lap_time   = 0
-        self.best_lap_time   = 0
-        self.collision_count = 0
+        self.lap_count         = 0
+        self.lap_time          = 0
+        self.last_lap_time     = 0
+        self.best_lap_time     = 0
+        self.collision_count   = 0
+        self.checkpoint_count  = 0
+        self.current_checkpoint = 0
         # Vehicle commands
         self.throttle_command = 0.0 # [-1, 1]
         self.steering_command = 0.0 # [-1, 1]
@@ -290,6 +292,39 @@ def publish_stack_segmentation_data(payload_json: str):
     except Exception:
         import traceback; traceback.print_exc()
 
+def publish_stack_pointcloud_data(payload_json: str):
+    try:
+        from sensor_msgs.msg import PointCloud2, PointField
+        import struct
+        p = json.loads(payload_json)
+        raw = base64.b64decode(p['points'])
+
+        # Points are in simulator world frame (X, Y horizontal; Z=height ~0.06m).
+        # No remapping needed — pass through directly so RViz shows a flat
+        # top-down track map in the 'world' frame.
+        pts = np.frombuffer(raw, dtype=np.float32).reshape(-1, 3)
+        remapped_raw = pts.tobytes()
+        count = len(pts)
+
+        msg = PointCloud2()
+        msg.header.stamp = autodrive_bridge.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+        msg.height = 1
+        msg.width = count
+        msg.fields = [
+            PointField(name='x', offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * count
+        msg.data = remapped_raw
+        msg.is_dense = True
+        publishers['pub_stack_pointcloud'].publish(msg)
+    except Exception:
+        import traceback; traceback.print_exc()
+
 def publish_stack_boundary_data(payload_json: str):
     try:
         p = json.loads(payload_json)
@@ -362,8 +397,15 @@ def publish_to_network(autodrive):
             'linear_acceleration': autodrive.linear_acceleration.tolist(),
             'front_camera': front_cam_payload,
             'depth_camera': depth_cam_payload,
+            'lidar': autodrive.lidar_range_array.tolist() if len(autodrive.lidar_range_array) > 0 else None,
+            'collision_count':    int(autodrive.collision_count),
+            'lap_count':          int(autodrive.lap_count),
+            'lap_time':           float(autodrive.lap_time),
+            'last_lap_time':      float(autodrive.last_lap_time),
+            'checkpoint_count':   int(autodrive.checkpoint_count),
+            'current_checkpoint': int(autodrive.current_checkpoint),
         }
-        
+
         # Serialize and send (non-blocking)
         msg_json = json.dumps(payload)
         zmq_publisher.send_string(msg_json, zmq.NOBLOCK)
@@ -457,25 +499,29 @@ def _process_frame(data):
             autodrive._front_jpeg = base64.b64decode(data["V1 Front Camera Image"])
         autodrive._depth_jpeg = base64.b64decode(data["V1 Depth Camera Image"]) if "V1 Depth Camera Image" in data else None
         # Lap data
-        autodrive.lap_count = int(float(data["V1 Lap Count"]))
-        autodrive.lap_time = float(data["V1 Lap Time"])
-        autodrive.last_lap_time = float(data["V1 Last Lap Time"])
-        autodrive.best_lap_time = float(data["V1 Best Lap Time"])
-        autodrive.collision_count = int(float(data["V1 Collisions"]))
+        autodrive.lap_count          = int(float(data.get("V1 Lap Count", 0)))
+        autodrive.lap_time           = float(data.get("V1 Lap Time", 0.0))
+        autodrive.last_lap_time      = float(data.get("V1 Last Lap Time", float('inf')))
+        autodrive.best_lap_time      = float(data.get("V1 Best Lap Time", float('inf')))
+        # "V1 Collisions" comes from AutomobileController (empty for this scene/vehicle type).
+        # "V1 Wall Touches" comes from LapTimer.OnTriggerEnter — use whichever is non-zero.
+        autodrive.collision_count    = int(float(data.get("V1 Wall Touches", 0))) or int(float(data.get("V1 Collisions", 0)))
+        autodrive.checkpoint_count   = int(float(data.get("V1 Checkpoint Count", 0)))
+        autodrive.current_checkpoint = int(float(data.get("V1 Current Checkpoint", 0)))
 
         # ROS2 publishing (scalar topics only — image topics skipped, ~100ms saved)
-        # publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
-        # publish_speed_data(autodrive.speed)
-        # publish_encoder_data(autodrive.encoder_angles)
-        # publish_ips_data(autodrive.position)
-        # publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
-        # broadcast_transforms(transform_broadcaster, autodrive)
-        # publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
-        # publish_lap_count_data(autodrive.lap_count)
-        # publish_lap_time_data(autodrive.lap_time)
-        # publish_last_lap_time_data(autodrive.last_lap_time)
-        # publish_best_lap_time_data(autodrive.best_lap_time)
-        # publish_collision_count_data(autodrive.collision_count)
+        publish_actuator_feedbacks(autodrive.throttle, autodrive.steering)
+        publish_speed_data(autodrive.speed)
+        publish_encoder_data(autodrive.encoder_angles)
+        publish_ips_data(autodrive.position)
+        publish_imu_data(autodrive.orientation_quaternion, autodrive.angular_velocity, autodrive.linear_acceleration)
+        broadcast_transforms(transform_broadcaster, autodrive)
+        publish_lidar_scan(autodrive.lidar_scan_rate, autodrive.lidar_range_array, autodrive.lidar_intensity_array)
+        publish_lap_count_data(autodrive.lap_count)
+        publish_lap_time_data(autodrive.lap_time)
+        publish_last_lap_time_data(autodrive.last_lap_time)
+        publish_best_lap_time_data(autodrive.best_lap_time)
+        publish_collision_count_data(autodrive.collision_count)
 
         # ZMQ publish to pilot_core
         publish_to_network(autodrive)
@@ -543,7 +589,7 @@ def zmq_command_receiver_thread(zmq_subscriber):
             payload_text = msg_text
             if " " in msg_text:
                 candidate_topic, candidate_payload = msg_text.split(" ", 1)
-                if candidate_topic in {"control", "telemetry", "pose", "segmentation", "map", "boundary"}:
+                if candidate_topic in {"control", "telemetry", "pose", "segmentation", "map", "boundary", "pointcloud"}:
                     topic = candidate_topic
                     payload_text = candidate_payload
 
@@ -571,6 +617,9 @@ def zmq_command_receiver_thread(zmq_subscriber):
 
             elif topic == "map" or topic == "boundary":
                 publish_stack_boundary_data(payload_text)
+
+            elif topic == "pointcloud":
+                publish_stack_pointcloud_data(payload_text)
 
             elif topic is None or topic == "control":
                 # Update command state — bridge() emits these on the next simulator frame
